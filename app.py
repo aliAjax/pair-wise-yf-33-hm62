@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,8 +35,11 @@ def overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: dateti
 
 class Repository:
     def __init__(self, path: str | Path):
-        self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
-        self.conn.row_factory = sqlite3.Row; self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None, timeout=30)
+        self.conn.row_factory = sqlite3.Row; self.conn.execute("PRAGMA foreign_keys=ON"); self.conn.execute("PRAGMA journal_mode=WAL"); self.conn.execute("PRAGMA busy_timeout=30000")
+        self.lock = threading.RLock()
+        had_schedules = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schedules'").fetchone()
+        self.preexisting_schema = bool(had_schedules)
         self.conn.executescript("""
         CREATE TABLE IF NOT EXISTS satellites(id TEXT PRIMARY KEY, name TEXT NOT NULL, data_rate_mbps REAL NOT NULL, priority INTEGER NOT NULL, storage_capacity_mb REAL NOT NULL, tenant TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active');
         CREATE TABLE IF NOT EXISTS stations(id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', weather TEXT NOT NULL DEFAULT 'clear');
@@ -46,13 +50,24 @@ class Repository:
         CREATE TABLE IF NOT EXISTS quotas(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant TEXT NOT NULL, station_id TEXT NOT NULL REFERENCES stations(id), daily_seconds INTEGER NOT NULL, UNIQUE(tenant,station_id));
         CREATE TABLE IF NOT EXISTS schedules(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL UNIQUE REFERENCES requests(id), window_id INTEGER NOT NULL REFERENCES visibility_windows(id), station_id TEXT NOT NULL REFERENCES stations(id), antenna_id TEXT NOT NULL REFERENCES antennas(id), satellite_id TEXT NOT NULL REFERENCES satellites(id), starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, rate_mbps REAL NOT NULL, status TEXT NOT NULL DEFAULT 'scheduled', revision INTEGER NOT NULL DEFAULT 1, disposition_reason TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER, schedule_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS receipt_entries(id INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id INTEGER NOT NULL REFERENCES schedules(id), external_receipt_id TEXT, window_revision INTEGER NOT NULL, actual_starts_at TEXT NOT NULL, actual_ends_at TEXT NOT NULL, actual_received_mb REAL NOT NULL, status TEXT NOT NULL, reason TEXT, attempts INTEGER NOT NULL DEFAULT 0, submitted_by TEXT NOT NULL, submitted_role TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, processed_at TEXT);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_unique_schedule ON receipt_entries(schedule_id) WHERE status IN ('settled','held','pending_retry','processing');
+        CREATE TABLE IF NOT EXISTS settlements(id INTEGER PRIMARY KEY AUTOINCREMENT, schedule_id INTEGER NOT NULL UNIQUE REFERENCES schedules(id), receipt_id INTEGER REFERENCES receipt_entries(id), tenant TEXT NOT NULL, station_id TEXT NOT NULL, quota_date TEXT NOT NULL, planned_mb REAL NOT NULL, actual_mb REAL NOT NULL, planned_seconds REAL NOT NULL, billed_seconds REAL NOT NULL, refund_seconds REAL NOT NULL, source TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_settlements_tenant_day ON settlements(tenant, station_id, quota_date);
         """)
+        if not self.preexisting_schema:
+            self.conn.execute("PRAGMA user_version=1")
 
     @contextmanager
     def tx(self):
-        self.conn.execute("BEGIN IMMEDIATE")
-        try: yield self.conn; self.conn.execute("COMMIT")
-        except Exception: self.conn.execute("ROLLBACK"); raise
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.conn
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
 
     @staticmethod
     def audit(conn: sqlite3.Connection, request_id: int | None, schedule_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -61,7 +76,18 @@ class Repository:
 
 
 class SatelliteSchedulingService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path):
+        self.repo = Repository(path)
+        self._receipt_locks: dict[int, threading.Lock] = {}
+        self._receipt_locks_guard = threading.Lock()
+        self._backfill_legacy_plans()
+
+    def _receipt_lock(self, receipt_id: int) -> threading.Lock:
+        with self._receipt_locks_guard:
+            lock = self._receipt_locks.get(receipt_id)
+            if lock is None:
+                lock = threading.Lock(); self._receipt_locks[receipt_id] = lock
+            return lock
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -146,12 +172,14 @@ class SatelliteSchedulingService:
             request_id = cur.lastrowid; Repository.audit(conn, request_id, None, actor, role, "request_created", {"data_mb": float(data_mb), "deadline": iso(deadline)})
             return dict(conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone())
 
-    def _used_quota(self, conn: sqlite3.Connection, tenant: str, station: str, day: str, exclude_schedule: int | None = None) -> int:
-        sql = """SELECT COALESCE(SUM((julianday(s.ends_at)-julianday(s.starts_at))*86400),0) FROM schedules s JOIN requests r ON r.id=s.request_id
+    def _used_quota(self, conn: sqlite3.Connection, tenant: str, station: str, day: str, exclude_schedule: int | None = None) -> float:
+        sql = """SELECT COALESCE(SUM(COALESCE(st.billed_seconds,(julianday(s.ends_at)-julianday(s.starts_at))*86400)),0)
+                 FROM schedules s JOIN requests r ON r.id=s.request_id
+                 LEFT JOIN settlements st ON st.schedule_id=s.id
                  WHERE r.tenant=? AND s.station_id=? AND substr(s.starts_at,1,10)=? AND s.status IN ('scheduled','receiving','received')"""
         args: list[Any] = [tenant, station, day]
         if exclude_schedule is not None: sql += " AND s.id!=?"; args.append(exclude_schedule)
-        return int(conn.execute(sql, args).fetchone()[0])
+        return float(conn.execute(sql, args).fetchone()[0])
 
     def schedule_request(self, request_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"operator", "commander"}: raise ApiError(403, "schedule_forbidden", "只有排程员可以安排接收")
@@ -281,6 +309,204 @@ class SatelliteSchedulingService:
             Repository.audit(conn, request_id, None, actor, role, "reschedule_requested", {"reason": body.get("reason", "")})
             return dict(conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone())
 
+    @staticmethod
+    def _receipt_payload(body: dict[str, Any]) -> tuple[int | None, int, datetime, datetime, float, str]:
+        external_id = str(body.get("external_receipt_id", "")).strip()
+        revision = body.get("window_revision")
+        start, end, received_mb = parse_time(body.get("actual_starts_at")), parse_time(body.get("actual_ends_at")), body.get("actual_received_mb")
+        if not isinstance(revision, int) or revision <= 0 or end <= start or not isinstance(received_mb, (int, float)) or float(received_mb) <= 0:
+            raise ApiError(400, "invalid_receipt", "回执版次、实际起止时刻和实际接收量无效")
+        return external_id or None, revision, start, end, float(received_mb), iso()
+
+    def _receipt_result(self, conn: sqlite3.Connection, entry_id: int) -> dict[str, Any]:
+        row = conn.execute("SELECT * FROM receipt_entries WHERE id=?", (entry_id,)).fetchone()
+        result = dict(row) if row else {}
+        settlement = conn.execute("SELECT * FROM settlements WHERE receipt_id=?", (entry_id,)).fetchone()
+        if settlement: result["settlement"] = dict(settlement)
+        return result
+
+    def submit_receipt(self, schedule_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"operator", "commander"}: raise ApiError(403, "receipt_forbidden", "当前角色不能提交接收回执")
+        external_id, revision, actual_start, actual_end, actual_mb, now = self._receipt_payload(body)
+        pending_retry_id: int | None = None
+        duplicate_result: dict[str, Any] | None = None
+        with self.repo.tx() as conn:
+            schedule = conn.execute("""SELECT s.*,r.tenant,r.data_mb FROM schedules s JOIN requests r ON r.id=s.request_id WHERE s.id=?""", (schedule_id,)).fetchone()
+            if not schedule: raise ApiError(404, "schedule_not_found", "排程不存在")
+            if schedule["status"] != "received": raise ApiError(409, "receipt_not_allowed", "只有已完成接收的排程可以登记回执")
+            existing = conn.execute("SELECT * FROM receipt_entries WHERE schedule_id=? AND status IN ('settled','held','pending_retry','processing') ORDER BY id DESC LIMIT 1", (schedule_id,)).fetchone()
+            if existing:
+                entry_id = existing["id"]
+                if existing["status"] == "pending_retry":
+                    pending_retry_id = entry_id
+                else:
+                    duplicate_result = self._receipt_result(conn, entry_id) | {"duplicate": True}
+            else:
+                cur = conn.execute("""INSERT INTO receipt_entries(schedule_id,external_receipt_id,window_revision,actual_starts_at,actual_ends_at,actual_received_mb,status,submitted_by,submitted_role,created_at,updated_at)
+                                      VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                                   (schedule_id, external_id, revision, iso(actual_start), iso(actual_end), actual_mb, "pending_retry", actor, role, now, now))
+                entry_id = cur.lastrowid
+        if pending_retry_id is not None:
+            return self.process_receipt(pending_retry_id, actor, role, retry=True)
+        if duplicate_result is not None:
+            return duplicate_result
+        return self.process_receipt(entry_id, actor, role, retry=False)
+
+    def _mark_receipt_failed(self, entry_id: int, reason: str, actor: str, role: str) -> dict[str, Any]:
+        with self.repo.tx() as conn:
+            conn.execute("UPDATE receipt_entries SET status='pending_retry',reason=?,attempts=attempts+1,updated_at=? WHERE id=?", (reason, iso(), entry_id))
+            row = conn.execute("SELECT schedule_id FROM receipt_entries WHERE id=?", (entry_id,)).fetchone()
+            if row:
+                Repository.audit(conn, None, entry_id, actor, role, "receipt_retry_pending", {"schedule_id": row["schedule_id"], "reason": reason})
+            return self._receipt_result(conn, entry_id)
+
+    def _process_receipt_entry(self, entry_id: int, actor: str, role: str, action: str) -> dict[str, Any]:
+        rejected_result: dict[str, Any] | None = None
+        with self.repo.tx() as conn:
+            entry = conn.execute("SELECT * FROM receipt_entries WHERE id=?", (entry_id,)).fetchone()
+            if not entry: raise ApiError(404, "receipt_not_found", "回执不存在")
+            if entry["status"] != "pending_retry": return self._receipt_result(conn, entry_id) | {"duplicate": entry["status"] == "settled"}
+            locked = conn.execute("UPDATE receipt_entries SET status='processing',updated_at=? WHERE id=? AND status='pending_retry'", (iso(), entry_id))
+            if locked.rowcount == 0: return self._receipt_result(conn, entry_id)
+            row = conn.execute("""SELECT e.*,s.request_id,s.window_id schedule_window_id,s.station_id,s.starts_at,s.ends_at,s.rate_mbps,r.tenant,r.data_mb,
+                                         w.starts_at window_starts_at,w.ends_at window_ends_at,w.revision visible_revision
+                                  FROM receipt_entries e
+                                  JOIN schedules s ON s.id=e.schedule_id
+                                  JOIN requests r ON r.id=s.request_id
+                                  JOIN visibility_windows w ON w.id=s.window_id
+                                  WHERE e.id=?""", (entry_id,)).fetchone()
+            actual_start, actual_end = parse_time(row["actual_starts_at"]), parse_time(row["actual_ends_at"])
+            window_start, window_end = parse_time(row["window_starts_at"]), parse_time(row["window_ends_at"])
+            if row["window_revision"] != row["visible_revision"]:
+                reason = f"窗口版次不一致: 回执={row['window_revision']} 本地={row['visible_revision']}"
+                conn.execute("UPDATE receipt_entries SET status='held',reason=?,processed_at=?,updated_at=? WHERE id=?", (reason, iso(), iso(), entry_id))
+                Repository.audit(conn, row["request_id"], entry_id, actor, role, "receipt_held", {"schedule_id": row["schedule_id"], "reason": reason})
+                return self._receipt_result(conn, entry_id)
+            if actual_start < window_start or actual_end > window_end:
+                reason = "实际接收时段超出可见窗口，整条回执拒绝"
+                conn.execute("UPDATE receipt_entries SET status='rejected',reason=?,processed_at=?,updated_at=? WHERE id=?", (reason, iso(), iso(), entry_id))
+                Repository.audit(conn, row["request_id"], entry_id, actor, role, "receipt_rejected", {"schedule_id": row["schedule_id"], "reason": reason})
+                rejected_result = self._receipt_result(conn, entry_id)
+            else:
+                planned_seconds = (parse_time(row["ends_at"]) - parse_time(row["starts_at"])).total_seconds()
+                shortfall_mb = max(0.0, float(row["data_mb"]) - float(row["actual_received_mb"]))
+                refund_seconds = min(planned_seconds, shortfall_mb * 8.0 / float(row["rate_mbps"]))
+                billed_seconds = planned_seconds - refund_seconds
+                quota_date = row["starts_at"][:10]
+                conn.execute("""INSERT OR IGNORE INTO settlements(schedule_id,receipt_id,tenant,station_id,quota_date,planned_mb,actual_mb,planned_seconds,billed_seconds,refund_seconds,source,created_at)
+                                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                             (row["schedule_id"], entry_id, row["tenant"], row["station_id"], quota_date, float(row["data_mb"]), float(row["actual_received_mb"]), planned_seconds, billed_seconds, refund_seconds, "receipt", iso()))
+                settlement = conn.execute("SELECT * FROM settlements WHERE schedule_id=?", (row["schedule_id"],)).fetchone()
+                conn.execute("UPDATE receipt_entries SET status='settled',reason=NULL,processed_at=?,updated_at=? WHERE id=?", (iso(), iso(), entry_id))
+                Repository.audit(conn, row["request_id"], entry_id, actor, role, action, {"schedule_id": row["schedule_id"], "actual_mb": float(row["actual_received_mb"]), "refund_seconds": refund_seconds, "settlement_id": settlement["id"]})
+                result = self._receipt_result(conn, entry_id)
+        if rejected_result is not None:
+            raise ApiError(422, "receipt_outside_window", rejected_result.get("reason") or "实际接收时段超出可见窗口，整条回执拒绝", rejected_result)
+        return result
+
+    def process_receipt(self, entry_id: int, actor: str, role: str, retry: bool) -> dict[str, Any]:
+        if role not in {"operator", "commander"}: raise ApiError(403, "receipt_forbidden", "当前角色不能处理接收回执")
+        lock = self._receipt_lock(entry_id)
+        with lock:
+            try:
+                return self._process_receipt_entry(entry_id, actor, role, "receipt_retried" if retry else "receipt_settled")
+            except ApiError:
+                raise
+            except Exception as exc:
+                return self._mark_receipt_failed(entry_id, repr(exc), actor, role)
+
+    def recheck_receipt(self, entry_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"operator", "commander"}: raise ApiError(403, "receipt_forbidden", "当前角色不能核对回执")
+        with self.repo.tx() as conn:
+            entry = conn.execute("SELECT * FROM receipt_entries WHERE id=?", (entry_id,)).fetchone()
+            if not entry: raise ApiError(404, "receipt_not_found", "回执不存在")
+            if entry["status"] != "held": raise ApiError(409, "receipt_not_held", "只有挂起待核对的回执可以重新核对")
+            conn.execute("UPDATE receipt_entries SET status='pending_retry',reason=NULL,updated_at=? WHERE id=?", (iso(), entry_id))
+        return self.process_receipt(entry_id, actor, role, retry=True)
+
+    def retry_receipt(self, entry_id: int, actor: str, role: str) -> dict[str, Any]:
+        if role not in {"operator", "commander"}: raise ApiError(403, "receipt_forbidden", "当前角色不能处理接收回执")
+        with self.repo.tx() as conn:
+            entry = conn.execute("SELECT status FROM receipt_entries WHERE id=?", (entry_id,)).fetchone()
+            if not entry: raise ApiError(404, "receipt_not_found", "回执不存在")
+            status = entry["status"]
+            if status == "processing":
+                recovered = conn.execute("UPDATE receipt_entries SET status='pending_retry',reason='恢复上次写入失败的处理',updated_at=? WHERE id=? AND status='processing'", (iso(), entry_id)).rowcount
+                if not recovered:
+                    status = conn.execute("SELECT status FROM receipt_entries WHERE id=?", (entry_id,)).fetchone()[0]
+        if status == "held": return self.recheck_receipt(entry_id, actor, role)
+        if status == "settled":
+            with self.repo.tx() as conn: return self._receipt_result(conn, entry_id) | {"duplicate": True}
+        if status != "pending_retry": raise ApiError(409, "receipt_not_retryable", f"回执当前状态 {status} 不能重试")
+        return self.process_receipt(entry_id, actor, role, retry=True)
+
+    def list_receipts(self, role: str) -> list[dict[str, Any]]:
+        if role not in {"operator", "commander", "auditor"}: raise ApiError(403, "receipt_forbidden", "当前角色不能查看回执入口")
+        return [dict(x) for x in self.repo.conn.execute("SELECT * FROM receipt_entries ORDER BY id DESC")]
+
+    def list_settlements(self, role: str) -> list[dict[str, Any]]:
+        if role not in {"operator", "commander", "auditor"}: raise ApiError(403, "settlement_forbidden", "当前角色不能查看结算账")
+        return [dict(x) for x in self.repo.conn.execute("SELECT * FROM settlements ORDER BY id DESC")]
+
+    def reconciliation(self, role: str) -> dict[str, Any]:
+        if role not in {"operator", "commander", "auditor"}: raise ApiError(403, "reconciliation_forbidden", "当前角色不能查看对账台")
+        rows = self.repo.conn.execute("""
+            SELECT s.id schedule_id,s.request_id,r.tenant,s.station_id,s.starts_at,s.ends_at,s.rate_mbps,r.data_mb planned_mb,
+                   w.revision visible_revision,e.id receipt_id,e.status receipt_status,e.window_revision,e.actual_starts_at,e.actual_ends_at,
+                   e.actual_received_mb,e.reason,e.attempts,st.id settlement_id,st.actual_mb settled_mb,st.billed_seconds,st.refund_seconds,st.source settlement_source
+            FROM schedules s
+            JOIN requests r ON r.id=s.request_id
+            JOIN visibility_windows w ON w.id=s.window_id
+            LEFT JOIN settlements st ON st.schedule_id=s.id
+            LEFT JOIN receipt_entries e ON e.id=(SELECT id FROM receipt_entries WHERE schedule_id=s.id ORDER BY id DESC LIMIT 1)
+            WHERE s.status='received' ORDER BY s.id DESC""").fetchall()
+        items = []
+        for row in rows:
+            item = dict(row)
+            if item["settlement_id"] is not None:
+                item["reconciliation_status"] = "backfilled_plan" if item["settlement_source"] == "legacy_plan" else "settled"
+            elif item["receipt_status"] in {"held", "pending_retry", "processing", "rejected"}:
+                item["reconciliation_status"] = item["receipt_status"]
+            elif item["receipt_status"] == "settled":
+                item["reconciliation_status"] = "settled"
+            else:
+                item["reconciliation_status"] = "missing_receipt"
+            item["revision_matches"] = item["window_revision"] is None or item["window_revision"] == item["visible_revision"]
+            item["difference_mb"] = (item["settled_mb"] if item["settled_mb"] is not None else 0.0) - float(item["planned_mb"])
+            items.append(item)
+        summary = {
+            "schedules": len(items),
+            "settled": sum(x["reconciliation_status"] == "settled" for x in items),
+            "backfilled_plan": sum(x["reconciliation_status"] == "backfilled_plan" for x in items),
+            "held": sum(x["reconciliation_status"] == "held" for x in items),
+            "pending_retry": sum(x["reconciliation_status"] in {"pending_retry", "processing"} for x in items),
+            "rejected": sum(x["reconciliation_status"] == "rejected" for x in items),
+            "missing_receipt": sum(x["reconciliation_status"] == "missing_receipt" for x in items),
+            "planned_total_mb": sum(float(x["planned_mb"]) for x in items),
+            "accepted_total_mb": sum(float(x["settled_mb"] or 0.0) for x in items),
+            "total_refund_seconds": sum(float(x["refund_seconds"] or 0.0) for x in items),
+        }
+        return {"summary": summary, "items": items}
+
+    def _backfill_legacy_plans(self) -> None:
+        with self.repo.tx() as conn:
+            if int(conn.execute("PRAGMA user_version").fetchone()[0]) >= 1:
+                return
+            rows = conn.execute("""
+                SELECT s.id,s.request_id,s.station_id,r.tenant,s.starts_at,s.ends_at,r.data_mb
+                FROM schedules s JOIN requests r ON r.id=s.request_id
+                WHERE s.status='received'
+                  AND NOT EXISTS (SELECT 1 FROM settlements st WHERE st.schedule_id=s.id)
+                  AND NOT EXISTS (SELECT 1 FROM receipt_entries e WHERE e.schedule_id=s.id AND e.status IN ('settled','held','pending_retry','processing'))""").fetchall()
+            for row in rows:
+                planned_seconds = (parse_time(row["ends_at"]) - parse_time(row["starts_at"])).total_seconds()
+                cur = conn.execute("""INSERT INTO settlements(schedule_id,receipt_id,tenant,station_id,quota_date,planned_mb,actual_mb,planned_seconds,billed_seconds,refund_seconds,source,created_at)
+                                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                   (row["id"], None, row["tenant"], row["station_id"], row["starts_at"][:10], float(row["data_mb"]), float(row["data_mb"]), planned_seconds, planned_seconds, 0.0, "legacy_plan", iso()))
+                Repository.audit(conn, row["request_id"], row["id"], "system", "operator", "legacy_plan_backfilled", {"settlement_id": cur.lastrowid})
+            if self.repo.preexisting_schema:
+                conn.execute("PRAGMA user_version=1")
+
     def state(self, role: str, tenant: str) -> dict[str, Any]:
         conn = self.repo.conn
         if role == "requester":
@@ -314,6 +540,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/health": return 200, {"status": "ok", "service": "satellite-scheduling"}
         actor, role, tenant = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, tenant)
+        if path == "/api/receipts": return 200, self.service.list_receipts(role)
+        if path == "/api/settlements": return 200, self.service.list_settlements(role)
+        if path == "/api/reconciliation": return 200, self.service.reconciliation(role)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "schedules"] and parts[2].isdigit(): return 200, self.service.get_schedule(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
@@ -336,8 +565,10 @@ class Handler(BaseHTTPRequestHandler):
         if len(parts) == 4 and parts[:2] == ["api", "schedules"] and parts[2].isdigit():
             sid, action = int(parts[2]), parts[3]
             if action in {"start", "complete"}: return 200, self.service.transition(sid, actor, role, tenant, "receiving" if action == "start" else "received", body)
+            if action == "receipt": return 200, self.service.submit_receipt(sid, actor, role, body)
             if action == "cancel": return 200, self.service.cancel_schedule(sid, actor, role, tenant, body)
             if action == "preempt": return 200, self.service.emergency_preempt(sid, actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "receipts"] and parts[2].isdigit() and parts[3] == "retry": return 200, self.service.retry_receipt(int(parts[2]), actor, role)
         if len(parts) == 4 and parts[:2] == ["api", "visibility-windows"] and parts[2].isdigit() and parts[3] == "change": return 200, self.service.change_window(int(parts[2]), actor, role, body)
         raise ApiError(404, "not_found", "接口不存在")
     def handle_request(self, method: str) -> None:
