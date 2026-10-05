@@ -19,6 +19,13 @@ python3 app.py --db satellite_scheduling.db
 - `POST /api/requests/{id}/schedule`、`/reschedule`：排程或重排被抢占请求。
 - `POST /api/schedules/{id}/start`、`/complete`、`/cancel`、`/preempt`：接收状态和紧急抢占。
 - `POST /api/visibility-windows/{id}/change`：窗口变化并返回受影响排程；已接收数据保留。
+- `POST /api/receipts`：登记接收回执（实际起止时刻与接收量），同一排程重复回执只结算一次；窗口版次不一致挂起待核对，超出可见窗口整条拒绝，少收部分退回租户当天配额。
+- `POST /api/receipts/{id}/retry`：重试待处理回执的结算，已结算幂等返回、不重复入账。
+- `GET /api/receipts`、`GET /api/receipts/{id}`：回执入口查询。
+- `GET /api/settlements`、`GET /api/settlements/{id}`：结算账查询。
+- `GET /api/reconciliation`：对账台（待处理/挂起/拒绝/待回填汇总与结算总量）。
+- `POST /api/reconciliation/backfill`：指挥官升级回填历史无回执排程，按计划值结算。
+- `GET /api/quotas/usage?tenant=&station_id=&day=`：租户当日配额用量查询。
 - `GET /api/state`、`GET /api/schedules/{id}`：权限化状态查询。
 
 ## 测试
